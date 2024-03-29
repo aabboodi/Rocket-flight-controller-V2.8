@@ -44,6 +44,8 @@ uint32_t logEndAddr = 0;
 Adafruit_BMP280 bmp(&Wire2);
 Servo servoX;
 Servo servoY;
+const int servoXPin = 8;
+const int servoYPin = 9;
 
 bool testState = false;
 bool prelaunchState = false;
@@ -73,8 +75,7 @@ BuzzerState buzzerState = BUZZER_OFF;
 unsigned long lastBuzzerChangeTime = 0;
 const unsigned long buzzerOnDuration = 300;
 
-const int servoXPin = 8;
-const int servoYPin = 9;
+
 bool buttonPressed = false;
 float previousFilteredGyro = 0.0;
 float previousFilteredAccel = 0.0;
@@ -86,11 +87,10 @@ float velocity = 0.0;
 
 float integralPitchError = 0;
 float integralRollError = 0;
+float integralYawError = 0;
 float previousPitchError = 0;
 float previousRollError = 0;
-
-const float MAX_GYRO_X = 5.0;
-const float MAX_GYRO_Y = 5.0;
+float previousYawError = 0;
 const float MIN_ALTITUDE = 0.0;
 const float MAX_ALTITUDE = 1000.0;
 const float MIN_BATTERY_VOLTAGE = 11.0;
@@ -107,15 +107,11 @@ void setupServos();
 int servoXAngle;
 int servoYAngle;
 
-Kalman kalmanRoll;
-Kalman kalmanPitch;
-Kalman kalmanYaw;
+
 float desiredRoll = 0.0f; // Set desired roll angle to 0 degrees
 float desiredPitch = 0.0f; // Set desired pitch angle to 10 degrees
 float desiredYaw = -5.33f; // Set desired yaw angle to -5 degrees
-float  gyrox;
-float  gyroy;
-float  gyroz;
+
 float gyroData[3];
 bool isWelcomeMessagePrinted = false;
 // Define buffer size and create a circular buffer
@@ -149,18 +145,13 @@ void setup() {
   pinMode(33, INPUT_PULLUP); // Test state pin
   pinMode(34, INPUT_PULLUP); // Prelaunch pin
   pinMode(35, INPUT_PULLUP); // Launch pin
-  
+  setupServos();
    // Initialize initial pressure
   initialPressure = bmp.readPressure();// Measure at ground level
-  kalmanRoll.setAngle(0); // Set initial angle for roll
-  kalmanPitch.setAngle(0); // Set initial angle for pitch
-   kalmanYaw.setAngle(0);// Set initial angle for Yaw
 
   // Initial parachute deployment altitude limits
   PARACHUTE_DEPLOYMENT_ALTITUDE_MIN = initialPressure - 25.0;// Adjust the value accordingly
-  // Initial servo angles
-  servoX.write(0);
-  servoY.write(0);
+
 
   pinMode(buzzer, OUTPUT);
 
@@ -277,8 +268,8 @@ void setupFlashMemory() {
 
 void loop() {
 
- readIMUData();
- adjustFins();
+readIMUData();
+adjustFins();
 
 
   // Clear flash memory if the button is pressed
@@ -302,7 +293,7 @@ void loop() {
     myIMU.readGyroData(gyroData);
     // Access gyro data
    
- teststatePIN.update();
+  teststatePIN.update();
   prelaunchstatePIN.update();
   launchstatePIN.update();
 
@@ -482,10 +473,9 @@ void printTestResult(bool result) {
 
 bool prelaunchStateSetup() {
   initializeMPU9250();
-  readNoiseVoltage();
+  readIMUData();
   adjustFins();
-  calculateRollError(desiredRoll,  gyrox);
-  calculatePitchError(desiredPitch,  gyroy);
+  readNoiseVoltage();
   safetyChecks();
   saveLogsToFlash();
   ringBuzzer();
@@ -493,8 +483,8 @@ bool prelaunchStateSetup() {
   Serial.println("Performing prelaunch safety checks...");
 
   // Check conditions for successful setup
-  bool successfulSetup = (calculatePitchError(desiredPitch,  gyroy) == 0.0) &&
-                         (calculateRollError(desiredRoll,  gyrox) == 0.0) &&
+  bool successfulSetup = (calculatePitchError(desiredPitch) == 0.0) &&
+                         (calculateRollError(desiredRoll) == 0.0) &&
                          (servoXAngle == 0) &&  // Assuming servoXAngle represents the angle of the servo controlling the fins
                          (servoYAngle == 0) &&  // Assuming servoYAngle represents the angle of the servo controlling the fins
                          (readNoiseVoltage() < 1.0) &&
@@ -506,14 +496,13 @@ bool prelaunchStateSetup() {
 bool launchstateSetup() {
   
   readNoiseVoltage();
-  calculateRollError(desiredRoll, gyrox);
-  calculatePitchError(desiredPitch, gyroy);
+  readIMUData();
   adjustFins();
   saveLogsToFlash();
   ringBuzzer();
   blueLED();
- bool successfulSetup =(calculatePitchError(desiredPitch,  gyroy) == 0.0) &&
-                         (calculateRollError(desiredRoll,  gyrox) == 0.0) &&
+ bool successfulSetup =(calculatePitchError(desiredPitch) == 0.0) &&
+                         (calculateRollError(desiredRoll) == 0.0) &&
                        (servoXAngle == 0) && // Assuming servoXAngle represents the angle of the servo controlling the fins
                        (servoYAngle == 0) && // Assuming servoYAngle represents the angle of the servo controlling the fins
                        (readNoiseVoltage() < 1.0) &&
@@ -524,8 +513,7 @@ bool launchstateSetup() {
 
 bool flightStateSetup() {
   readNoiseVoltage();
-  calculateRollError(desiredRoll,  gyrox);
-  calculatePitchError(desiredPitch,  gyroy);
+  readIMUData();
   adjustFins();
   saveLogsToFlash();
   ringBuzzer();
@@ -965,7 +953,41 @@ float readNoiseVoltage() {
     float voltage = sensorValue * (MAX_VOLTAGE / 1023.0);
     return voltage;
 }
+bool printBMPData() {
+  Serial.print(F("Temperature = "));
+  Serial.print(bmp.readTemperature());
+  Serial.println(" *C");
 
+  Serial.print(F("Pressure = "));
+  Serial.print(bmp.readPressure());
+  Serial.println(" Pa");
+
+  Serial.print(F("Approx altitude = "));
+  Serial.print(bmp.readAltitude(1019)); /* Adjusted to local forecast! */
+  Serial.println(" m");
+
+  // Assuming printing is successful
+  return true;
+}
+bool processGPSData() {
+  bool dataPrinted = false;
+
+ if (Serial3.available()) {
+  char c = Serial3.read();
+  Serial3.write(c);  // Corrected from Serial3.print(c);
+  dataPrinted = true;
+ }
+
+ if (Serial3.available()) {
+  char c = Serial3.read();
+  Serial.write(c);  // Corrected from Serial3.print(c);
+  delay(100);
+  dataPrinted = true;
+ }
+
+
+  return dataPrinted;
+}
 bool readIMUData() {
     // If intPin goes high, all data registers have new data
     if (myIMU.readByte(MPU9250_ADDRESS, INT_STATUS) & 0x01) {
@@ -1025,148 +1047,93 @@ bool readIMUData() {
 
     return false; // Return false if no new data is available
 }
-bool printBMPData() {
-  Serial.print(F("Temperature = "));
-  Serial.print(bmp.readTemperature());
-  Serial.println(" *C");
+// Function to adjust fins based on IMU data
+bool adjustFins() {
+    unsigned long startTime = millis();
+    const unsigned long timeout = 500; // 500 milliseconds timeout
 
-  Serial.print(F("Pressure = "));
-  Serial.print(bmp.readPressure());
-  Serial.println(" Pa");
+    // Check if there is valid data in the buffer
+    if (bufferHead != bufferTail) {
+        // Get the latest IMU data from the buffer
+        IMUData data = buffer[bufferTail];
+        bufferTail = (bufferTail + 1) % BUFFER_SIZE;
 
-  Serial.print(F("Approx altitude = "));
-  Serial.print(bmp.readAltitude(1019)); /* Adjusted to local forecast! */
-  Serial.println(" m");
+        // Calculate pitch, roll, and yaw errors
+         float pitchError = calculatePitchError(desiredPitch);
+         float rollError = calculateRollError(desiredRoll);
+         float yawError = calculateYawError(desiredYaw);
 
-  // Assuming printing is successful
-  return true;
+        // PID controller coefficients
+        float Kp = 1.0; // Proportional gain
+        float Ki = 0.0; // Integral gain
+        float Kd = 0.0; // Derivative gain
+
+        // Calculate integral and derivative terms
+        integralPitchError += pitchError;
+        integralRollError += rollError;
+        integralYawError += yawError;
+        float derivativePitchError = pitchError - previousPitchError;
+        float derivativeRollError = rollError - previousRollError;
+        float derivativeYawError = yawError - previousYawError;
+
+        // Limit the integral windup
+        float integratorLimit = 50.0;
+        integralPitchError = constrain(integralPitchError, -integratorLimit, integratorLimit);
+        integralRollError = constrain(integralRollError, -integratorLimit, integratorLimit);
+        integralYawError = constrain(integralYawError, -integratorLimit, integratorLimit);
+
+        // Calculate servo angles using PID controller
+        servoXAngle = map(Kp * pitchError + Ki * integralPitchError + Kd * derivativePitchError, -90, 90, 0, 180);
+        servoYAngle = map(Kp * rollError + Ki * integralRollError + Kd * derivativeRollError, -90, 90, 0, 180);
+        // Add yaw error correction to one of the servo angles (e.g., servoYAngle)
+        servoYAngle += map(Kp * yawError + Ki * integralYawError + Kd * derivativeYawError, -90, 90, -45, 45);
+
+        // Update servo positions
+        servoX.write(servoXAngle);
+        servoY.write(servoYAngle);
+
+        // Update previous errors for next iteration
+        previousPitchError = pitchError;
+        previousRollError = rollError;
+        previousYawError = yawError;
+
+        // Print errors for debugging (optional)
+        Serial.print("Pitch Error: ");
+        Serial.print(pitchError);
+        Serial.print("\tRoll Error: ");
+        Serial.print(rollError);
+        Serial.print("\tYaw Error: ");
+        Serial.println(yawError);
+
+        return true; // Return true to indicate the adjustment was performed
+    } else if (millis() - startTime >= timeout) {
+        // Timeout reached, return false
+        Serial.println("Timeout reached while reading IMU data for fin adjustment.");
+        return false;
+    }
+    return false;
 }
 
 
-bool processGPSData() {
-  bool dataPrinted = false;
+float calculatePitchError(float desiredPitch) {
+    return desiredPitch - buffer[bufferHead].pitch;
+}
 
- if (Serial3.available()) {
-  char c = Serial3.read();
-  Serial3.write(c);  // Corrected from Serial3.print(c);
-  dataPrinted = true;
- }
+float calculateRollError(float desiredRoll) {
+    return desiredRoll - buffer[bufferHead].roll;
+}
 
- if (Serial3.available()) {
-  char c = Serial3.read();
-  Serial.write(c);  // Corrected from Serial3.print(c);
-  delay(100);
-  dataPrinted = true;
- }
+float calculateYawError(float desiredYaw) {
+    return desiredYaw - buffer[bufferHead].yaw;
 
-
-  return dataPrinted;
 }
 void setupServos() {
+    // Initial servo angles
+  servoX.write(0);
+  servoY.write(0);
   servoX.attach(servoXPin);
   servoY.attach(servoYPin);
 }
-// Function to adjust fins based on IMU data
-bool adjustFins() {
-  unsigned long startTime = millis();
-  const unsigned long timeout = 500; // 500 milliseconds timeout
-
-  // Check if there is valid data in the buffer
-  if (bufferHead != bufferTail) {
-    // Get the latest IMU data from the buffer
-    IMUData data = buffer[bufferTail];
-    bufferTail = (bufferTail + 1) % BUFFER_SIZE;
-
-
-
-    float pitchError = calculatePitchError(desiredPitch, gyroy);
-    float rollError = calculateRollError(desiredRoll, gyrox);
-    float yawError = calculateYawError(desiredYaw, gyroz);
-
-    float Kp = 1.0;
-    float Ki = 0.0;
-    float Kd = 0.0;
-
-    integralPitchError += pitchError;
-    integralRollError += rollError;
-
-    float derivativePitchError = pitchError - previousPitchError;
-    float derivativeRollError = rollError - previousRollError;
-
-    float integratorLimit = 50.0;
-    integralPitchError = constrain(integralPitchError, -integratorLimit, integratorLimit);
-    integralRollError = constrain(integralRollError, -integratorLimit, integratorLimit);
-
-    servoXAngle = map(Kp * pitchError + Ki * integralPitchError + Kd * derivativePitchError, -90, 90, 0, 180);
-    servoYAngle = map(Kp * rollError + Ki * integralRollError + Kd * derivativeRollError, -90, 90, 0, 180);
-
-    servoX.write(servoXAngle);
-    servoY.write(servoYAngle);
-
-    previousPitchError = pitchError;
-    previousRollError = rollError;
-
-    Serial.print("Pitch Error: ");
-    Serial.print(pitchError);
-    Serial.print("\tRoll Error: ");
-    Serial.println(rollError);
-    Serial.print("Yaw Error: ");
-    Serial.println(yawError);
-
-    return true; // Return true to indicate the adjustment was performed
-  } else if (millis() - startTime >= timeout) {
-    // Timeout reached, return false
-    Serial.println("Timeout reached while reading IMU data for fin adjustment.");
-    return false;
-  }
-}
-
-unsigned long timer = 0;
-float calculatePitchError(float desiredPitch, float  gyroy) {
-    // Calculate the time delta
-    double dt = (double)(micros() - timer) / 1000000;
-    timer = micros();
-
-    // Update Kalman filter for pitch angle
-    kalmanPitch.getRate(); // Update the Kalman filter rate first
-    kalmanPitch.setAngle(myIMU.pitch); // Update the Kalman filter with the latest IMU angle
-    double kalPitchAngle = kalmanPitch.getAngle(myIMU.pitch,  gyroy, dt);
-
-    // Calculate pitch error
-    float pitchError = desiredPitch - kalPitchAngle;
-    return pitchError;
-}
-
-float calculateRollError(float desiredRoll, float  gyrox) {
-    // Calculate the time delta
-    double dt = (double)(micros() - timer) / 1000000;
-    timer = micros();
-
-    // Update Kalman filter for roll angle
-    kalmanRoll.getRate(); // Update the Kalman filter rate first
-    kalmanRoll.setAngle(myIMU.roll); // Update the Kalman filter with the latest IMU angle
-    double kalRollAngle = kalmanRoll.getAngle(myIMU.roll,  gyrox, dt);
-
-    // Calculate roll error
-    float rollError = desiredRoll - kalRollAngle;
-    return rollError;
-}
-
-float calculateYawError(float desiredYaw, float  gyroz) {
-    // Calculate the time delta
-    double dt = (double)(micros() - timer) / 1000000;
-    timer = micros();
-
-    // Update Kalman filter for yaw angle
-    kalmanYaw.getRate(); // Update the Kalman filter rate first
-    kalmanYaw.setAngle(myIMU.yaw); // Update the Kalman filter with the latest IMU angle
-    double kalYawAngle = kalmanYaw.getAngle(myIMU.yaw,  gyroz, dt);
-
-    // Calculate yaw error
-    float yawError = desiredYaw - kalYawAngle;
-    return yawError;
-}
-
 void ringBuzzer() {
     switch (buzzerState) {
     case BUZZER_OFF:
